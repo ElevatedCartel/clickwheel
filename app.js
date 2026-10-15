@@ -65,6 +65,8 @@ const S = {
 const pagesEl = $('#pages');
 const audio = new Audio();
 audio.preload = 'auto';
+// Keep the player in the page: iOS ties lock-screen controls more reliably to an attached element.
+document.body.append(audio);
 
 // iOS fixes media volume at 1 (hardware buttons only); detect so the wheel scrubs instead.
 const volumeSettable = (() => { const a = new Audio(); a.volume = 0.5; return a.volume === 0.5; })();
@@ -170,27 +172,71 @@ function deletePl(id) { S.playlists = S.playlists.filter((p) => p.id !== id); db
 
 // ---------------------------------------------------------------- player
 
-let audioURL = null;
 let loadSeq = 0;
 let pendingSeek = null;
 const current = () => S.queue[S.index];
 const shuffled = (a) => { const r = a.slice(); for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; } return r; };
 
-async function load(play) {
-  const t = current();
-  if (!t) return;
-  const seq = ++loadSeq;
-  const blob = await db.get('audio', t.id);
-  if (seq !== loadSeq) return;
-  if (!blob) { toast('Song file is missing'); return; }
-  if (audioURL) URL.revokeObjectURL(audioURL);
-  audioURL = URL.createObjectURL(blob);
-  audio.src = audioURL;
+// Playable URLs for the current song and its neighbors, kept ready ahead of time. Lock-screen
+// next/previous (and auto-advance while locked) must switch songs synchronously: iOS can stall
+// storage reads in the background and won't start playback after an async gap.
+const readyURLs = new Map();   // track id -> object URL
+const pendingURLs = new Map(); // track id -> Promise<object URL | null>
+
+function urlFor(t) {
+  if (readyURLs.has(t.id)) return Promise.resolve(readyURLs.get(t.id));
+  if (!pendingURLs.has(t.id)) {
+    pendingURLs.set(t.id, db.get('audio', t.id).then((blob) => {
+      pendingURLs.delete(t.id);
+      if (!blob) return null;
+      const u = URL.createObjectURL(blob);
+      readyURLs.set(t.id, u);
+      return u;
+    }, () => { pendingURLs.delete(t.id); return null; }));
+  }
+  return pendingURLs.get(t.id);
+}
+
+function neighbors() {
+  const q = S.queue, i = S.index, out = [];
+  if (!q.length) return out;
+  out.push(q[i]);
+  if (i + 1 < q.length) out.push(q[i + 1]);
+  else if (S.repeat === 'All') out.push(q[0]);
+  if (i > 0) out.push(q[i - 1]);
+  return out.filter(Boolean);
+}
+
+function prefetch() {
+  const keep = neighbors();
+  const ids = new Set(keep.map((t) => t.id));
+  for (const [id, u] of readyURLs) {
+    if (!ids.has(id) && u !== audio.src) { URL.revokeObjectURL(u); readyURLs.delete(id); }
+  }
+  for (const t of keep) urlFor(t);
+}
+
+function start(url, play) {
+  audio.src = url;
   S.playing = play;
   if (play) audio.play().catch((e) => { if (e.name === 'NotAllowedError') { S.playing = false; render(); } });
   updateSession();
   render();
   saveResume();
+  prefetch();
+}
+
+function load(play) {
+  const t = current();
+  if (!t) return;
+  const seq = ++loadSeq;
+  const ready = readyURLs.get(t.id);
+  if (ready) { start(ready, play); return; }
+  urlFor(t).then((u) => {
+    if (seq !== loadSeq) return;
+    if (!u) { toast('Song file is missing'); return; }
+    start(u, play);
+  });
 }
 
 function playList(list, start) {
@@ -228,12 +274,14 @@ function reshuffle() {
     S.queue = S.unshuffled.slice();
     S.index = Math.max(0, S.queue.findIndex((t) => t.id === now.id));
   }
+  prefetch();
 }
 
 function playNext(t) {
   if (!S.queue.length) { playList([t], 0); return; }
   S.queue.splice(S.index + 1, 0, t);
   S.unshuffled.push(t);
+  prefetch();
 }
 
 function resume() {
@@ -290,7 +338,7 @@ function removeFromQueue(id) {
   } else if (wasCurrent) {
     S.index = Math.min(S.index, S.queue.length - 1);
     load(S.playing);
-  }
+  } else prefetch();
   saveResume();
 }
 
@@ -298,7 +346,7 @@ audio.addEventListener('ended', () => {
   if (unlocking || audio.src === SILENT_WAV) return;
   if (S.repeat === 'One') { audio.currentTime = 0; audio.play().catch(() => {}); } else next();
 });
-audio.addEventListener('play', () => { if (!unlocking) { S.playing = true; render(); } });
+audio.addEventListener('play', () => { if (!unlocking) { S.playing = true; registerControls(); render(); } });
 audio.addEventListener('pause', () => {
   // Phone calls, Siri, unplugged headphones: the system pauses us.
   if (!unlocking && !audio.ended && audio.src) { S.playing = false; render(); }
@@ -333,14 +381,20 @@ function restoreResume() {
 
 // Lock screen / Control Center / headphone buttons.
 const ms = 'mediaSession' in navigator ? navigator.mediaSession : null;
-if (ms) {
+// iOS shows ±10 s skip buttons instead of track buttons unless the seek actions are explicitly
+// cleared, and it can drop handlers when a new source starts, so they're re-registered on every play.
+function registerControls() {
+  if (!ms) return;
   const on = (a, f) => { try { ms.setActionHandler(a, f); } catch { /* unsupported action */ } };
   on('play', resume);
   on('pause', pause);
   on('nexttrack', next);
   on('previoustrack', prev);
   on('seekto', (e) => seek(e.seekTime));
+  on('seekbackward', null);
+  on('seekforward', null);
 }
+registerControls();
 async function updateSession() {
   if (!ms) return;
   const t = current();
@@ -758,7 +812,7 @@ function menuFor(r) {
       return { title: 'Settings', items: [
         item('About', () => { refreshStorage(); push({ t: 'about' }); }),
         item('Shuffle', () => { S.shuffle = !S.shuffle; ls.set('shuffle', S.shuffle); reshuffle(); }, { acc: { value: S.shuffle ? 'Songs' : 'Off' } }),
-        item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); }, { acc: { value: S.repeat } }),
+        item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); prefetch(); }, { acc: { value: S.repeat } }),
         item('Clicker', () => { S.clicker = !S.clicker; ls.set('clicker', S.clicker); }, { acc: { value: S.clicker ? 'On' : 'Off' } }),
         item('Haptics', () => { S.haptics = !S.haptics; ls.set('haptics', S.haptics); }, { acc: { value: S.haptics ? 'On' : 'Off' } }),
         item('Finish', () => { S.theme = cycle(['white', 'silver', 'black'], S.theme); ls.set('theme', S.theme); applyTheme(); },

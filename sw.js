@@ -1,6 +1,6 @@
 // Offline shell: the app's own files are cached on first visit and served from the cache after.
 // Bump VERSION whenever any file changes so phones pick up the update.
-const VERSION = 'clickwheel-v1';
+const VERSION = 'clickwheel-v3';
 const FILES = ['./', 'index.html', 'app.css', 'app.js', 'db.js', 'tags.js', 'manifest.webmanifest',
   'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
