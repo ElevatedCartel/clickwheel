@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob: data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>ClickWheel</title>
+  <meta name="theme-color" content="#cfd0d4">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="ClickWheel">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main id="ipod" class="theme-silver">
+    <div id="bezel">
+      <div id="screen">
+        <div id="status">
+          <span id="st-play"></span>
+          <span id="st-title">iPod</span>
+          <span id="battery" aria-hidden="true"><i></i></span>
+        </div>
+        <div id="pages"></div>
+        <div id="letter" hidden></div>
+        <div id="toast" role="status" hidden></div>
+      </div>
+    </div>
+    <div id="wheel-wrap">
+      <div id="wheel" role="application" aria-label="Click wheel. Arrow keys scroll, Enter selects, Escape goes back, Space plays or pauses.">
+        <span class="lbl menu">MENU</span>
+        <svg class="lbl next" viewBox="0 0 26 14" aria-hidden="true"><path d="M0 0l10 7-10 7zM10 0l10 7-10 7zM21 0h3v14h-3z"/></svg>
+        <svg class="lbl prev" viewBox="0 0 26 14" aria-hidden="true"><path d="M26 0l-10 7 10 7zM16 0L6 7l10 7zM5 0H2v14h3z"/></svg>
+        <svg class="lbl pp" viewBox="0 0 24 14" aria-hidden="true"><path d="M0 0l11 7-11 7zM14 0h3.5v14H14zM20.5 0H24v14h-3.5z"/></svg>
+        <div id="center"></div>
+      </div>
+    </div>
+  </main>
+
+  <div id="modal" hidden>
+    <form id="modal-form" autocomplete="off">
+      <label id="modal-title" for="modal-input">New Playlist</label>
+      <input id="modal-input" maxlength="80" enterkeyhint="done" spellcheck="false">
+      <div class="buttons">
+        <button type="button" id="modal-cancel">Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <input type="file" id="picker" multiple accept="audio/*,.mp3,.m4a,.m4b,.aac,.wav,.aif,.aiff,.caf,.flac,.ogg,.opus" hidden>
+  <input type="file" id="restore" accept="application/json,.json" hidden>
+  <label id="haptic" aria-hidden="true"><input type="checkbox" switch tabindex="-1"></label>
+</body>
+</html>
