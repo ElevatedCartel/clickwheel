@@ -1,6 +1,7 @@
 import { db } from './db.js';
 import { readTags } from './tags.js';
 
+const APP_VERSION = '5';
 const ROWS = 7;
 const TICK = (2 * Math.PI) / 28; // wheel angle per scroll step
 const HOLD_MS = 450;
@@ -555,6 +556,8 @@ function select() {
   const r = top().route;
   if (r.t === 'nowPlaying') {
     if (volumeSettable) { S.scrubbing = !S.scrubbing; S.showVolume = false; render(); }
+    // On iPhone the wheel already scrubs, so a plain center click opens the song menu (Repeat etc.).
+    else if (current()) push({ t: 'songActions', id: current().id });
     return;
   }
   if (r.t === 'plReorder') {
@@ -662,6 +665,10 @@ function endGesture(e) {
 wheel.addEventListener('pointerup', endGesture);
 wheel.addEventListener('pointercancel', endGesture);
 wheel.addEventListener('contextmenu', (e) => e.preventDefault());
+// Stop iOS from claiming a held finger for its own long-press gestures, which cancels the press
+// (pointercancel) before the hold timer fires. Pointer events still arrive.
+wheel.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+wheel.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
 
 // Desktop conveniences: scroll wheel / trackpad and keyboard.
 let wheelAcc = 0;
@@ -833,7 +840,7 @@ function menuFor(r) {
         info('Playlists', S.playlists.length),
         info('Total Time', clock(total)),
         info('Storage Used', S.storageText),
-        info('Version', '1.0'),
+        info('Version', APP_VERSION),
       ] };
     }
     case 'nowPlaying':
