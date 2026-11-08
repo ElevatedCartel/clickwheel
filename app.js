@@ -1,7 +1,7 @@
 import { db } from './db.js';
 import { readTags } from './tags.js';
 
-const APP_VERSION = '5';
+const APP_VERSION = '6';
 const ROWS = 7;
 const TICK = (2 * Math.PI) / 28; // wheel angle per scroll step
 const HOLD_MS = 450;
@@ -717,6 +717,7 @@ function menuFor(r) {
         item('Playlists', () => push({ t: 'playlists' })),
         item('Shuffle Songs', () => { if (shuffleAll()) push({ t: 'nowPlaying' }); }, { acc: null }),
         item('Import Songs', () => $('#picker').click(), { acc: null }),
+        item('Import Folder', () => $('#folder-picker').click(), { acc: null }),
         item('Settings', () => push({ t: 'settings' })),
       ];
       if (current()) items.push(item('Now Playing', () => push({ t: 'nowPlaying' })));
@@ -1073,11 +1074,14 @@ $('#modal-cancel').addEventListener('click', closeModal);
 
 // ---------------------------------------------------------------- file pickers
 
-$('#picker').addEventListener('change', async (e) => {
-  const files = e.target.files;
-  if (files?.length) await importFiles(files);
-  e.target.value = '';
-});
+// Folder import picks a whole folder (and its subfolders); non-audio files are skipped.
+for (const id of ['#picker', '#folder-picker']) {
+  $(id).addEventListener('change', async (e) => {
+    const files = e.target.files;
+    if (files?.length) await importFiles(files);
+    e.target.value = '';
+  });
+}
 $('#restore').addEventListener('change', async (e) => {
   const f = e.target.files?.[0];
   if (f) await restore(f);
