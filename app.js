@@ -785,7 +785,12 @@ function menuFor(r) {
     case 'songActions': {
       const t = byId(r.id);
       if (!t) return { title: 'Song', items: [] };
+      // For the song that's playing, Repeat comes first so it can be changed without leaving Now Playing.
+      const repeat = current()?.id === t.id
+        ? [item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); prefetch(); }, { acc: { value: S.repeat } })]
+        : [];
       return { title: t.title, items: [
+        ...repeat,
         item('Play Next', () => { playNext(t); toast('Playing next'); pop(); }, { acc: null }),
         item('Add to Playlist', () => push({ t: 'addTo', id: t.id })),
         item('Go to Album', () => push({ t: 'album', title: t.album, artist: t.artist })),
