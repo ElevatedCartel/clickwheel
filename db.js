@@ -1,9 +1,9 @@
 // Tiny promise wrapper over IndexedDB.
-// Stores: tracks (metadata), audio (song blobs), art (cover blobs), playlists.
+// Stores: tracks (metadata), audio (song/video data), art (cover blobs), playlists.
 
 const NAME = 'clickwheel';
 const VERSION = 1;
-let opening;
+let opening = null;
 
 function open() {
   opening ??= new Promise((resolve, reject) => {
@@ -15,16 +15,21 @@ function open() {
       d.createObjectStore('art');
       d.createObjectStore('playlists', { keyPath: 'id' });
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const d = req.result;
+      // iOS closes the connection when the app sits in the background; reopen on next use.
+      d.onclose = () => { opening = null; };
+      d.onversionchange = () => { d.close(); opening = null; };
+      resolve(d);
+    };
+    req.onerror = () => { opening = null; reject(req.error); };
   });
   return opening;
 }
 
-async function run(store, mode, fn) {
-  const d = await open();
+function attempt(d, store, mode, fn) {
   return new Promise((resolve, reject) => {
-    const tx = d.transaction(store, mode);
+    const tx = d.transaction(store, mode); // throws if the connection was closed under us
     let result;
     const req = fn(tx.objectStore(store));
     if (req) req.onsuccess = () => { result = req.result; };
@@ -32,6 +37,17 @@ async function run(store, mode, fn) {
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });
+}
+
+async function run(store, mode, fn) {
+  try {
+    return await attempt(await open(), store, mode, fn);
+  } catch (err) {
+    if (err?.name === 'QuotaExceededError') throw err;
+    // Stale or lost connection ("Connection to Indexed Database server lost"): reconnect once.
+    opening = null;
+    return attempt(await open(), store, mode, fn);
+  }
 }
 
 export const db = {

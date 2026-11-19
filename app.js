@@ -1,7 +1,7 @@
 import { db } from './db.js';
 import { readTags } from './tags.js';
 
-const APP_VERSION = '6';
+const APP_VERSION = '8';
 const ROWS = 7;
 const TICK = (2 * Math.PI) / 28; // wheel angle per scroll step
 const HOLD_MS = 450;
@@ -60,6 +60,7 @@ const S = {
   haptics: ls.get('haptics', true),
   theme: ls.get('theme', 'silver'),
   volume: ls.get('volume', 0.8),
+  soundCheck: ls.get('soundCheck', false),
   storageText: '…',
 };
 
@@ -77,16 +78,18 @@ if (volumeSettable) audio.volume = S.volume;
 
 const byId = (id) => S.tracks.find((t) => t.id === id);
 const plById = (id) => S.playlists.find((p) => p.id === id);
-const songs = () => [...S.tracks].sort((a, b) => cmp(a.title, b.title));
-const artists = () => [...new Set(S.tracks.map((t) => t.artist))].sort(cmp);
+const music = () => S.tracks.filter((t) => t.kind !== 'video');
+const videos = () => S.tracks.filter((t) => t.kind === 'video').sort((a, b) => cmp(a.title, b.title));
+const songs = () => music().sort((a, b) => cmp(a.title, b.title));
+const artists = () => [...new Set(music().map((t) => t.artist))].sort(cmp);
 function albums(artist) {
   const m = new Map();
-  for (const t of S.tracks) if (!artist || t.artist === artist) m.set(t.artist + '\u0000' + t.album, { title: t.album, artist: t.artist });
+  for (const t of music()) if (!artist || t.artist === artist) m.set(t.artist + '\u0000' + t.album, { title: t.album, artist: t.artist });
   return [...m.values()].sort((a, b) => cmp(a.title, b.title));
 }
 const albumOrder = (a, b) => (a.album !== b.album ? cmp(a.album, b.album) : (a.trackNo ?? 1e9) - (b.trackNo ?? 1e9) || cmp(a.title, b.title));
-const artistTracks = (a) => S.tracks.filter((t) => t.artist === a).sort(albumOrder);
-const albumTracks = (al) => S.tracks.filter((t) => t.album === al.title && t.artist === al.artist).sort(albumOrder);
+const artistTracks = (a) => music().filter((t) => t.artist === a).sort(albumOrder);
+const albumTracks = (al) => music().filter((t) => t.album === al.title && t.artist === al.artist).sort(albumOrder);
 const plTracks = (p) => p.trackIds.map(byId).filter(Boolean);
 
 const artURLs = new Map();
@@ -103,22 +106,52 @@ const AUDIO_EXT = /\.(mp3|m4a|m4b|aac|alac|mp4|wav|aif|aiff|caf|flac|ogg|oga|opu
 const MIME = { mp3: 'audio/mpeg', m4a: 'audio/mp4', m4b: 'audio/mp4', mp4: 'audio/mp4', aac: 'audio/aac', alac: 'audio/mp4',
   wav: 'audio/wav', aif: 'audio/aiff', aiff: 'audio/aiff', caf: 'audio/x-caf', flac: 'audio/flac', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg' };
 
+const VIDEO_EXT = /\.(m4v|mov)$/i;
+const isVideoFile = (f) => f.type.startsWith('video/') || VIDEO_EXT.test(f.name);
+
+// Songs are saved as raw bytes ({type, buf}), which iOS keeps inside its database file. Blobs
+// (used before, and still for videos, which are too big to hold in memory) live as separate files
+// that iOS has been known to lose, so every read is checked.
+async function storeMedia(id, f) {
+  const ext = (f.name.split('.').pop() || '').toLowerCase();
+  const type = f.type || MIME[ext] || 'audio/mpeg';
+  if (isVideoFile(f)) await db.put('audio', new Blob([f], { type }), id);
+  else await db.put('audio', { type, buf: await f.arrayBuffer() }, id);
+}
+
+async function readMedia(id) {
+  try {
+    const v = await db.get('audio', id);
+    if (v?.buf) return new Blob([v.buf], { type: v.type });
+    if (v instanceof Blob) { await v.slice(0, 1).arrayBuffer(); return v; } // throws if the file is gone
+  } catch (err) {
+    console.warn('Unreadable media', id, err);
+  }
+  return null;
+}
+
 async function importFiles(fileList) {
-  const files = [...fileList].filter((f) => f.type.startsWith('audio/') || AUDIO_EXT.test(f.name));
-  if (!files.length) { toast('No audio files selected'); return; }
-  let added = 0, skipped = 0;
+  const files = [...fileList].filter((f) => f.type.startsWith('audio/') || isVideoFile(f) || AUDIO_EXT.test(f.name));
+  if (!files.length) { toast('No audio or video files selected'); return; }
+  let added = 0, skipped = 0, repaired = 0;
   for (const [i, f] of files.entries()) {
     toast(`Importing ${i + 1} of ${files.length}…`, 0);
-    if (S.tracks.some((t) => t.fileName === f.name && t.size === f.size)) { skipped++; continue; }
     try {
-      const tags = await readTags(f);
+      const dup = S.tracks.find((t) => t.fileName === f.name && t.size === f.size);
+      if (dup) {
+        // Already in the library: keep it (and its playlists) but replace the data if it can't be read.
+        if (await readMedia(dup.id)) skipped++;
+        else { await storeMedia(dup.id, f); readyURLs.delete(dup.id); repaired++; }
+        continue;
+      }
+      const video = isVideoFile(f);
+      const tags = video ? {} : await readTags(f);
       const id = crypto.randomUUID();
-      const ext = (f.name.split('.').pop() || '').toLowerCase();
-      // Copy the bytes; iOS can discard the picker's temporary file later.
-      await db.put('audio', new Blob([await f.arrayBuffer()], { type: f.type || MIME[ext] || 'audio/mpeg' }), id);
+      await storeMedia(id, f);
       if (tags.art) await db.put('art', tags.art, id);
       const t = {
         id,
+        kind: video ? 'video' : 'audio',
         title: tags.title || f.name.replace(/\.[^.]+$/, ''),
         artist: tags.artist || 'Unknown Artist',
         album: tags.album || 'Unknown Album',
@@ -138,10 +171,12 @@ async function importFiles(fileList) {
     }
   }
   render();
-  let msg = added ? `Imported ${plural(added, 'song')}` : 'Nothing imported';
+  let msg = added ? `Imported ${plural(added, 'file')}` : 'Nothing new imported';
+  if (repaired) msg += `\nRepaired ${plural(repaired, 'file')}`;
   if (skipped) msg += `\n${skipped} already in library`;
   toast(msg);
   navigator.storage?.persist?.();
+  analyzeLibrary();
 }
 
 async function deleteTrack(id) {
@@ -187,7 +222,7 @@ const pendingURLs = new Map(); // track id -> Promise<object URL | null>
 function urlFor(t) {
   if (readyURLs.has(t.id)) return Promise.resolve(readyURLs.get(t.id));
   if (!pendingURLs.has(t.id)) {
-    pendingURLs.set(t.id, db.get('audio', t.id).then((blob) => {
+    pendingURLs.set(t.id, readMedia(t.id).then((blob) => {
       pendingURLs.delete(t.id);
       if (!blob) return null;
       const u = URL.createObjectURL(blob);
@@ -219,6 +254,7 @@ function prefetch() {
 
 function start(url, play) {
   audio.src = url;
+  applyLevel();
   S.playing = play;
   if (play) audio.play().catch((e) => { if (e.name === 'NotAllowedError') { S.playing = false; render(); } });
   updateSession();
@@ -235,7 +271,7 @@ function load(play) {
   if (ready) { start(ready, play); return; }
   urlFor(t).then((u) => {
     if (seq !== loadSeq) return;
-    if (!u) { toast('Song file is missing'); return; }
+    if (!u) { toast('Can’t read this song.\nImport it again to repair it.', 3500); return; }
     start(u, play);
   });
 }
@@ -256,9 +292,10 @@ function playList(list, start) {
 }
 
 function shuffleAll() {
-  if (!S.tracks.length) { toast('No songs yet'); return false; }
-  S.unshuffled = S.tracks.slice();
-  S.queue = shuffled(S.tracks);
+  const all = music();
+  if (!all.length) { toast('No songs yet'); return false; }
+  S.unshuffled = all.slice();
+  S.queue = shuffled(all);
   S.index = 0;
   load(true);
   return true;
@@ -283,6 +320,53 @@ function playNext(t) {
   S.queue.splice(S.index + 1, 0, t);
   S.unshuffled.push(t);
   prefetch();
+  saveResume();
+}
+
+function playLater(t) {
+  if (!S.queue.length) { playList([t], 0); return; }
+  S.queue.push(t);
+  S.unshuffled.push(t);
+  prefetch();
+  saveResume();
+}
+
+const upNextCount = () => Math.max(0, S.queue.length - S.index - 1);
+
+// Positions are queue indexes after the current song; the same song can appear more than once.
+function jumpTo(pos) {
+  if (!S.queue[pos]) return;
+  S.index = pos;
+  load(true);
+}
+
+function removeQueueAt(pos) {
+  const t = S.queue[pos];
+  if (!t || pos === S.index) return;
+  S.queue.splice(pos, 1);
+  if (pos < S.index) S.index--;
+  const u = S.unshuffled.indexOf(t);
+  if (u >= 0) S.unshuffled.splice(u, 1);
+  prefetch();
+  saveResume();
+}
+
+function moveQueue(pos, where) {
+  const t = S.queue[pos];
+  if (!t || pos === S.index) return;
+  S.queue.splice(pos, 1);
+  if (pos < S.index) S.index--;
+  if (where === 'next') S.queue.splice(S.index + 1, 0, t);
+  else S.queue.push(t);
+  prefetch();
+  saveResume();
+}
+
+function clearUpNext() {
+  const removed = S.queue.splice(S.index + 1);
+  S.unshuffled = S.unshuffled.filter((t) => !removed.includes(t) || t === current());
+  prefetch();
+  saveResume();
 }
 
 function resume() {
@@ -347,7 +431,10 @@ audio.addEventListener('ended', () => {
   if (unlocking || audio.src === SILENT_WAV) return;
   if (S.repeat === 'One') { audio.currentTime = 0; audio.play().catch(() => {}); } else next();
 });
-audio.addEventListener('play', () => { if (!unlocking) { S.playing = true; registerControls(); render(); } });
+audio.addEventListener('play', () => {
+  if (levelGain && ac?.state !== 'running') ac.resume().catch(() => {});
+  if (!unlocking) { S.playing = true; registerControls(); render(); }
+});
 audio.addEventListener('pause', () => {
   // Phone calls, Siri, unplugged headphones: the system pauses us.
   if (!unlocking && !audio.ended && audio.src) { S.playing = false; render(); }
@@ -433,6 +520,58 @@ const SILENT_WAV = (() => {
   return 'data:audio/wav;base64,' + btoa(String.fromCharCode(...b));
 })();
 
+// ---------------------------------------------------------------- video
+
+// Videos play on their own page, separate from the music queue: one <video> at a time, inside the
+// screen like a video iPod. Wheel scrubs, center or ⏯ plays/pauses, ⏮/⏭ jump 30 s, hold center = full screen.
+let videoEl = null, videoURL = null;
+
+function playVideo(t) {
+  if (S.playing) pause();
+  push({ t: 'video', id: t.id });
+}
+
+function stopVideo() {
+  if (!videoEl) return;
+  videoEl.pause();
+  videoEl.removeAttribute('src');
+  videoEl.load();
+  videoEl = null;
+  if (videoURL) { URL.revokeObjectURL(videoURL); videoURL = null; }
+}
+
+function scanBy(sec) {
+  if (top().route.t !== 'video') { seek(audio.currentTime + sec); return; }
+  if (!videoEl || !Number.isFinite(videoEl.duration)) return;
+  videoEl.currentTime = clamp(videoEl.currentTime + sec, 0, videoEl.duration);
+  updateVideoBar();
+}
+
+function updateVideoBar() {
+  const fill = pagesEl.lastElementChild?.querySelector('.vbar i');
+  if (fill && videoEl?.duration) fill.style.width = (videoEl.currentTime / videoEl.duration) * 100 + '%';
+}
+
+function renderVideo(page, r) {
+  if (page.dataset.kind === 'video') return;
+  page.dataset.kind = 'video';
+  const v = el('video', 'vid');
+  v.playsInline = true;
+  v.setAttribute('playsinline', '');
+  const bar = el('div', 'vbar');
+  bar.append(el('i'));
+  page.replaceChildren(v, bar);
+  videoEl = v;
+  v.addEventListener('timeupdate', updateVideoBar);
+  readMedia(r.id).then((blob) => {
+    if (videoEl !== v) return;
+    if (!blob) { toast('Can’t read this video.\nImport it again to repair it.', 3500); return; }
+    videoURL = URL.createObjectURL(blob);
+    v.src = videoURL;
+    v.play().catch(() => toast('Press ⏯ to play'));
+  });
+}
+
 // ---------------------------------------------------------------- feedback
 
 let ac = null, clickBuf = null;
@@ -453,6 +592,109 @@ function clickSound() {
   s.connect(ac.destination);
   s.start();
 }
+// ---------------------------------------------------------------- sound check (volume leveling)
+
+// Each song is measured once (decode → gated RMS loudness, roughly like ReplayGain) and gets a
+// gain that brings it to a common level, capped so quiet songs are never boosted into clipping.
+// iOS fixes media volume at 1, so the gain is applied by routing the player through Web Audio.
+const TARGET_DB = -14;
+let levelGain = null;
+const dbToGain = (db) => Math.pow(10, db / 20);
+
+// Needs a tap (Web Audio can only start from one), so it's called from the input handlers.
+function routeThroughGain() {
+  if (levelGain || !S.soundCheck || !ac) return;
+  try {
+    const src = ac.createMediaElementSource(audio);
+    levelGain = ac.createGain();
+    src.connect(levelGain).connect(ac.destination);
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* older Safari */ }
+    applyLevel();
+  } catch (err) {
+    console.warn('Sound Check unavailable', err);
+  }
+}
+
+function applyLevel() {
+  if (!levelGain) return;
+  const t = current();
+  const db = S.soundCheck && Number.isFinite(t?.gainDb) ? t.gainDb : 0;
+  levelGain.gain.setTargetAtTime(dbToGain(db), ac.currentTime, 0.05);
+}
+
+function gainFor(buf) {
+  const block = Math.max(1, Math.round(buf.sampleRate * 0.4));
+  const chans = [];
+  for (let c = 0; c < buf.numberOfChannels; c++) chans.push(buf.getChannelData(c));
+  const powers = [];
+  let peak = 0;
+  for (let s = 0; s < buf.length; s += block) {
+    const e = Math.min(buf.length, s + block);
+    let sum = 0;
+    for (const d of chans) {
+      for (let i = s; i < e; i++) {
+        const v = d[i];
+        sum += v * v;
+        if (v > peak) peak = v; else if (-v > peak) peak = -v;
+      }
+    }
+    powers.push(sum / ((e - s) * chans.length));
+  }
+  const audible = powers.filter((p) => p > 1e-7); // ignore silence below about -70 dB
+  if (!audible.length) return 0;
+  const mean = audible.reduce((a, b) => a + b, 0) / audible.length;
+  const body = audible.filter((p) => p > mean * 0.1); // ignore quiet passages 10 dB under the average
+  const loudness = 10 * Math.log10(body.reduce((a, b) => a + b, 0) / body.length);
+  const headroom = peak > 0 ? -20 * Math.log10(peak) - 1 : 0;
+  return Math.round(clamp(TARGET_DB - loudness, -12, Math.min(9, Math.max(0, headroom))) * 10) / 10;
+}
+
+async function measureGain(t) {
+  try {
+    const blob = await readMedia(t.id);
+    if (!blob || blob.size > 80e6) return 0; // very long files would use too much memory to decode
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const buf = await new OAC(1, 1, 44100).decodeAudioData(await blob.arrayBuffer());
+    return gainFor(buf);
+  } catch {
+    return 0;
+  }
+}
+
+let analyzing = false;
+async function analyzeLibrary() {
+  if (analyzing || !S.soundCheck) return;
+  analyzing = true;
+  try {
+    while (S.soundCheck) {
+      // Songs about to play first, then the rest of the library.
+      const t = neighbors().find((x) => x.gainDb == null) || music().find((x) => x.gainDb == null);
+      if (!t) break;
+      const g = await measureGain(t);
+      if (!byId(t.id)) continue; // deleted while measuring
+      t.gainDb = g;
+      db.put('tracks', t).catch(() => {});
+      if (t === current()) applyLevel();
+      if (top().route.t === 'about') render();
+      await new Promise((r) => setTimeout(r, 30));
+    }
+  } finally {
+    analyzing = false;
+  }
+}
+
+function toggleSoundCheck() {
+  S.soundCheck = !S.soundCheck;
+  ls.set('soundCheck', S.soundCheck);
+  if (S.soundCheck) {
+    routeThroughGain();
+    analyzeLibrary();
+    const left = music().filter((t) => t.gainDb == null).length;
+    if (left) toast(`Measuring ${plural(left, 'song')}…`);
+  }
+  applyLevel();
+}
+
 // Safari 18+ gives a haptic tap when a switch-style checkbox toggles; it's the only haptic a web app can trigger.
 const hapticLabel = $('#haptic');
 function haptic() { if (S.haptics) hapticLabel.click(); }
@@ -463,6 +705,7 @@ function tick() { haptic(); clickSound(); }
 const top = () => S.stack[S.stack.length - 1];
 
 function go(dir, mutate) {
+  if (top().route.t === 'video') stopVideo();
   S.held = null;
   S.scrubbing = false;
   S.showVolume = false;
@@ -507,6 +750,8 @@ function rotate(d) {
   lastTick = now;
   const r = top().route;
 
+  if (r.t === 'video') { scanBy(d * 5); tick(); return; }
+
   if (r.t === 'nowPlaying') {
     if (!current()) return;
     if (scrubMode()) {
@@ -545,6 +790,11 @@ function rotate(d) {
 
 function press(b) {
   haptic();
+  if (top().route.t === 'video' && b !== 'menu') {
+    if (b === 'next' || b === 'previous') scanBy(b === 'next' ? 30 : -30);
+    else if (videoEl) (videoEl.paused ? videoEl.play().catch(() => {}) : videoEl.pause());
+    return;
+  }
   if (b === 'center') select();
   else if (b === 'menu') back();
   else if (b === 'playPause') togglePlay();
@@ -577,6 +827,11 @@ function back() {
 
 function hold() {
   const r = top().route;
+  if (r.t === 'video') { // full screen (iPhone's own player; rotate the phone for landscape)
+    if (videoEl?.webkitEnterFullscreen) videoEl.webkitEnterFullscreen();
+    else videoEl?.requestFullscreen?.().catch(() => {});
+    return;
+  }
   if (r.t === 'nowPlaying') {
     const t = current();
     if (t) { haptic(); push({ t: 'songActions', id: t.id }); }
@@ -613,6 +868,7 @@ wheel.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   unlockAudio();
   ensureClick();
+  routeThroughGain();
   try { wheel.setPointerCapture(e.pointerId); } catch { /* synthetic pointer */ }
   const r = wheel.getBoundingClientRect();
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2, R = r.width / 2;
@@ -627,7 +883,7 @@ wheel.addEventListener('pointerdown', (e) => {
     if (g !== mine || !g.pressed) return;
     g.held = true;
     if (btn === 'next' || btn === 'previous') {
-      g.scan = setInterval(() => seek(audio.currentTime + (btn === 'next' ? 4 : -4)), 180);
+      g.scan = setInterval(() => scanBy(btn === 'next' ? 4 : -4), 180);
     } else if (btn === 'center') hold();
   }, HOLD_MS);
 });
@@ -690,6 +946,7 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();
   unlockAudio();
   ensureClick();
+  routeThroughGain();
   f();
 });
 
@@ -709,18 +966,25 @@ function songRows(list) {
 
 function cycle(list, v) { return list[(list.indexOf(v) + 1) % list.length]; }
 
+function showNowPlaying() {
+  if (S.stack.some((l) => l.route.t === 'nowPlaying')) popUntil((x) => x.t === 'nowPlaying');
+  else push({ t: 'nowPlaying' });
+}
+const upNextItem = () => item('Up Next', () => push({ t: 'upNext' }), { detail: upNextCount() });
+
 function menuFor(r) {
   switch (r.t) {
     case 'main': {
       const items = [
         item('Music', () => push({ t: 'music' })),
+        item('Videos', () => push({ t: 'videos' })),
         item('Playlists', () => push({ t: 'playlists' })),
         item('Shuffle Songs', () => { if (shuffleAll()) push({ t: 'nowPlaying' }); }, { acc: null }),
         item('Import Songs', () => $('#picker').click(), { acc: null }),
         item('Import Folder', () => $('#folder-picker').click(), { acc: null }),
         item('Settings', () => push({ t: 'settings' })),
       ];
-      if (current()) items.push(item('Now Playing', () => push({ t: 'nowPlaying' })));
+      if (current()) items.push(item('Now Playing', () => push({ t: 'nowPlaying' })), upNextItem());
       return { title: 'iPod', items };
     }
     case 'music':
@@ -793,17 +1057,41 @@ function menuFor(r) {
     case 'songActions': {
       const t = byId(r.id);
       if (!t) return { title: 'Song', items: [] };
-      // For the song that's playing, Repeat comes first so it can be changed without leaving Now Playing.
-      const repeat = current()?.id === t.id
-        ? [item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); prefetch(); }, { acc: { value: S.repeat } })]
-        : [];
+      // For the song that's playing, Repeat and Up Next come first so they're reachable from Now Playing.
+      const isCurrent = current()?.id === t.id;
+      const lead = isCurrent
+        ? [item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); prefetch(); }, { acc: { value: S.repeat } }),
+          upNextItem()]
+        : [item('Play Next', () => { playNext(t); toast('Playing next'); pop(); }, { acc: null }),
+          item('Play Later', () => { playLater(t); toast('Added to end of Up Next'); pop(); }, { acc: null })];
       return { title: t.title, items: [
-        ...repeat,
-        item('Play Next', () => { playNext(t); toast('Playing next'); pop(); }, { acc: null }),
+        ...lead,
         item('Add to Playlist', () => push({ t: 'addTo', id: t.id })),
         item('Go to Album', () => push({ t: 'album', title: t.album, artist: t.artist })),
         item('Go to Artist', () => push({ t: 'artist', name: t.artist })),
         item('Delete from Library', () => push({ t: 'songDelete', id: t.id })),
+      ] };
+    }
+    case 'upNext': {
+      const items = [];
+      for (let i = S.index + 1; i < S.queue.length; i++) {
+        const t = S.queue[i];
+        items.push({ title: t.title, acc: null,
+          action: () => { jumpTo(i); showNowPlaying(); },
+          hold: () => push({ t: 'queueItem', pos: i, id: t.id }) });
+      }
+      if (items.length) items.push(item('Clear Up Next', () => { clearUpNext(); toast('Up Next cleared'); }, { acc: null }));
+      return { title: 'Up Next', items, empty: 'Nothing up next' };
+    }
+    case 'queueItem': {
+      const pos = S.queue[r.pos]?.id === r.id && r.pos > S.index ? r.pos : S.queue.findIndex((t, i) => i > S.index && t.id === r.id);
+      const t = S.queue[pos];
+      if (!t) return { title: 'Up Next', items: [], empty: 'No longer in Up Next' };
+      return { title: t.title, items: [
+        item('Play Now', () => { jumpTo(pos); showNowPlaying(); }, { acc: null }),
+        item('Play Next', () => { moveQueue(pos, 'next'); toast('Playing next'); pop(); }, { acc: null }),
+        item('Move to End', () => { moveQueue(pos, 'end'); toast('Moved to end'); pop(); }, { acc: null }),
+        item('Remove from Up Next', () => { removeQueueAt(pos); toast('Removed'); pop(); }, { acc: null }),
       ] };
     }
     case 'addTo':
@@ -814,7 +1102,7 @@ function menuFor(r) {
     case 'songDelete':
       return { title: 'Delete?', items: [
         item('Cancel', pop, { acc: null }),
-        item('Delete Song', async () => {
+        item(byId(r.id)?.kind === 'video' ? 'Delete Video' : 'Delete Song', async () => {
           await deleteTrack(r.id);
           toast('Song deleted');
           popUntil((x) => x.t !== 'nowPlaying' && !(['songActions', 'songDelete', 'addTo'].includes(x.t) && x.id === r.id));
@@ -826,6 +1114,7 @@ function menuFor(r) {
         item('About', () => { refreshStorage(); push({ t: 'about' }); }),
         item('Shuffle', () => { S.shuffle = !S.shuffle; ls.set('shuffle', S.shuffle); reshuffle(); }, { acc: { value: S.shuffle ? 'Songs' : 'Off' } }),
         item('Repeat', () => { S.repeat = cycle(['Off', 'One', 'All'], S.repeat); ls.set('repeat', S.repeat); prefetch(); }, { acc: { value: S.repeat } }),
+        item('Sound Check', toggleSoundCheck, { acc: { value: S.soundCheck ? 'On' : 'Off' } }),
         item('Clicker', () => { S.clicker = !S.clicker; ls.set('clicker', S.clicker); }, { acc: { value: S.clicker ? 'On' : 'Off' } }),
         item('Haptics', () => { S.haptics = !S.haptics; ls.set('haptics', S.haptics); }, { acc: { value: S.haptics ? 'On' : 'Off' } }),
         item('Finish', () => { S.theme = cycle(['white', 'silver', 'black'], S.theme); ls.set('theme', S.theme); applyTheme(); },
@@ -834,18 +1123,25 @@ function menuFor(r) {
         item('Restore Playlists', () => $('#restore').click(), { acc: null }),
       ] };
     case 'about': {
-      const total = S.tracks.reduce((s, t) => s + (t.duration || 0), 0);
+      const total = music().reduce((s, t) => s + (t.duration || 0), 0);
       const info = (title, value) => ({ title, acc: { value: String(value) } });
       return { title: 'About', items: [
-        info('Songs', S.tracks.length),
+        info('Songs', music().length),
+        info('Videos', videos().length),
         info('Playlists', S.playlists.length),
         info('Total Time', clock(total)),
         info('Storage Used', S.storageText),
+        ...(S.soundCheck ? [info('Sound Check', `${music().filter((t) => t.gainDb != null).length} of ${music().length} measured`)] : []),
         info('Version', APP_VERSION),
       ] };
     }
     case 'nowPlaying':
       return { title: 'Now Playing', items: [] };
+    case 'videos':
+      return { title: 'Videos', alpha: true, empty: 'No videos.\nImport MP4 files\nfrom the main menu.',
+        items: videos().map((t) => ({ title: t.title, acc: null, action: () => playVideo(t), hold: () => push({ t: 'songDelete', id: t.id }) })) };
+    case 'video':
+      return { title: byId(r.id)?.title ?? 'Video', items: [] };
   }
   return { title: '', items: [] };
 }
@@ -917,6 +1213,7 @@ function render() {
     stPlay.innerHTML = playState ? ICON[playState] : '';
   }
   if (r.t === 'nowPlaying') renderNP(page);
+  else if (r.t === 'video') renderVideo(page, r);
   else if (r.t === 'main') renderMain(page, spec);
   else { page.dataset.kind = 'list'; page.replaceChildren(listEl(spec)); }
   renderOverlays();
@@ -945,7 +1242,7 @@ function listEl(spec) {
     if (it.detail != null) row.append(el('span', 'd', String(it.detail)));
     const a = accEl(it.acc);
     if (a) row.append(a);
-    row.addEventListener('click', () => { unlockAudio(); ensureClick(); tapRow(i); });
+    row.addEventListener('click', () => { unlockAudio(); ensureClick(); routeThroughGain(); tapRow(i); });
     list.append(row);
   }
   wrap.append(list);
@@ -1127,6 +1424,7 @@ async function boot() {
     S.tracks = tracks;
     S.playlists = playlists.sort((a, b) => a.createdAt - b.createdAt);
     restoreResume();
+    analyzeLibrary();
   } catch (err) {
     console.error(err);
     toast('Storage unavailable.\nPrivate Browsing?', 4000);

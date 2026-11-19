@@ -359,3 +359,9 @@ html, body {
 #modal-form button[type="submit"] { background: #1e6fd9; color: #fff; font-weight: 600; }
 
 #haptic { position: fixed; left: -100px; top: 0; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
+
+/* ---------- video */
+
+.vid { position: absolute; inset: 0; width: 100%; height: 100%; background: #000; object-fit: contain; }
+.vbar { position: absolute; left: 0; right: 0; bottom: 0; height: calc(var(--u) * 1.6); background: rgba(255,255,255,.25); }
+.vbar i { display: block; width: 0; height: 100%; background: linear-gradient(#7db9f5, #2c78da); }
